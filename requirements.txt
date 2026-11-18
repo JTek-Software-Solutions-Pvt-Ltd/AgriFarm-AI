@@ -15,4 +15,6 @@ huggingface_hub
 safetensors
 
 # FastAPI audio upload
+asyncpg
 python-multipart
+ddgs>=9.0,<10.0

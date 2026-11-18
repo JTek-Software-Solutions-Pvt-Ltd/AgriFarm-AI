@@ -9,37 +9,78 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.agents.graph import KisanDostGraph
 from app.api.routes import build_routes
 from app.api.voice_routes import router as voice_router
+from app.api.weather_routes import build_weather_router
 from app.config import get_settings
 from app.database import ConversationStore
+from app.postgres_db import connect_postgres, close_postgres
 from app.speech.adapter import SpeechAdapter
 
 settings = get_settings()
-logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO)
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Create shared application services and register chat routes."""
-    app.state.settings = settings
-    app.state.graph = KisanDostGraph(settings)
-    app.state.store = ConversationStore(settings)
-    app.state.speech = SpeechAdapter()
-    app.include_router(build_routes(app.state.graph, app.state.store, app.state.speech))
+    """Initialize shared services and release resources on shutdown."""
+
+    # Connect to the farmer PostgreSQL database before serving requests.
+    await connect_postgres()
+
     try:
+        app.state.settings = settings
+        app.state.graph = KisanDostGraph(settings)
+        app.state.store = ConversationStore(settings)
+        app.state.speech = SpeechAdapter()
+
+        # Register existing chat routes.
+        app.include_router(
+            build_routes(
+                app.state.graph,
+                app.state.store,
+                app.state.speech,
+            )
+        )
+
+        # Register the single Weather Advisory endpoint.
+        app.include_router(build_weather_router(settings))
+
         yield
+
     finally:
-        # Close optional services only when they expose an async/sync close method.
-        close = getattr(app.state.graph, "close", None)
-        if callable(close):
+        # Close the agent graph if it exposes a close method.
+        graph = getattr(app.state, "graph", None)
+        close_graph = getattr(graph, "close", None)
+
+        if callable(close_graph):
             try:
-                result = close()
+                result = close_graph()
                 if hasattr(result, "__await__"):
                     await result
             except Exception:
-                logging.getLogger(__name__).exception("Error while closing agent graph")
+                logging.getLogger(__name__).exception(
+                    "Error while closing agent graph"
+                )
+
+        # Always release the PostgreSQL connection pool.
+        try:
+            await close_postgres()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Error while closing PostgreSQL connection pool"
+            )
 
 
-app = FastAPI(title=settings.app_name, version="0.2.2", lifespan=lifespan)
+app = FastAPI(
+    title=settings.app_name,
+    version="0.2.2",
+    lifespan=lifespan,
+)
+
+
+# CORS configuration.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -54,12 +95,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Register Voice API routes.
 app.include_router(voice_router)
 
 
 @app.get("/")
 async def root() -> dict:
-    return {"name": settings.app_name, "status": "running", "docs": "/docs"}
+    return {
+        "name": settings.app_name,
+        "status": "running",
+        "docs": "/docs",
+    }
 
 
 @app.get("/health")
