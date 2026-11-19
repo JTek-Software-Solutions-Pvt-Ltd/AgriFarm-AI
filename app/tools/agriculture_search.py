@@ -1,107 +1,134 @@
-"""
-DuckDuckGo-backed agricultural research helper for Kisan Dost.
+"""Agricultural source discovery for Kisan Dost.
 
-Search results are discovery leads, not verified agronomic recommendations.
-The API returns source titles, URLs and snippets so the application can show
-provenance and avoid inventing crop suitability or treatment instructions.
-"""
+Search results are leads, not verified agronomic evidence. This module never
+claims that a crop, sowing window, pesticide, fertilizer dose, or treatment is
+suitable solely because a search result was returned.
 
+Compatible with the existing weather_routes.py call:
+    await AgricultureSearch().research(farmer, crop, current_weather, daily_forecast)
+"""
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     from ddgs import DDGS
-except ImportError:  # Keep weather advisory usable if optional search dependency is absent.
+except ImportError:  # Weather advisory must remain usable without optional search.
     DDGS = None  # type: ignore[assignment]
 
+logger = logging.getLogger(__name__)
 
-TRUSTED_DOMAIN_HINTS = (
-    ".icar.gov.in",
+# Exact host suffixes only. A random host containing "gov.in" is not trusted.
+PRIORITY_HOST_SUFFIXES = (
     "icar.gov.in",
-    ".gov.in",
     "agri.telangana.gov.in",
     "pjtsau.edu.in",
     "angrau.ac.in",
     "tnau.ac.in",
     "aau.in",
+    "hau.ac.in",
+    "pau.edu",
+    "uasbangalore.edu.in",
     " kvk",
 )
 
-_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
-_CACHE_TTL_SECONDS = 6 * 60 * 60
+_POSITIVE_CACHE_TTL = 6 * 60 * 60
+_NEGATIVE_CACHE_TTL = 5 * 60
 _CACHE_MAX_ITEMS = 128
+_SEARCH_TIMEOUT_SECONDS = 18
+_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 
-def _is_trusted_source(url: str) -> bool:
-    host = url.lower().split("://")[-1].split("/")[0].split(":")[0]
-    return any(hint.strip(". ") in host for hint in TRUSTED_DOMAIN_HINTS)
+def _host(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+
+
+def _is_priority_source(url: str) -> bool:
+    host = _host(url)
+    if not host:
+        return False
+    return any(host == suffix or host.endswith("." + suffix) for suffix in PRIORITY_HOST_SUFFIXES if suffix != " kvk")
+
+
+def _cache_key(query: str, max_results: int) -> str:
+    raw = f"{query.casefold()}|{max_results}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _search_sync(query: str, max_results: int) -> list[dict[str, Any]]:
     if DDGS is None:
-        raise RuntimeError(
-            "DuckDuckGo search dependency is missing. Install it with: pip install ddgs"
-        )
+        raise RuntimeError("Optional ddgs package is not installed")
 
-    # backend='auto' is intentional: forcing the DuckDuckGo-only backend can
-    # return no results even when DDGS automatic search works in the environment.
-    raw_results = DDGS(timeout=20).text(
+    # Keep backend auto: some environments block or throttle individual backends.
+    raw = DDGS(timeout=_SEARCH_TIMEOUT_SECONDS).text(
         query,
         region="in-en",
         safesearch="moderate",
         max_results=max_results,
         backend="auto",
     )
-
-    results: list[dict[str, Any]] = []
-    for item in raw_results or []:
+    output: list[dict[str, Any]] = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
         title = str(item.get("title") or "").strip()
         url = str(item.get("href") or "").strip()
         snippet = str(item.get("body") or "").strip()
-        if not title or not url:
+        if not title or not url or urlparse(url).scheme not in {"http", "https"}:
             continue
-        results.append({
+        priority = _is_priority_source(url)
+        output.append({
             "title": title,
             "url": url,
             "snippet": snippet,
-            "source_trust": "priority_source_domain" if _is_trusted_source(url) else "unverified_source",
+            "is_priority_source": priority,
+            "source_trust": "priority_source_domain" if priority else "unverified_source",
             "verification_status": "search_result_not_independently_verified",
         })
-    return results
-
-
-def _cache_key(query: str) -> str:
-    return hashlib.sha256(query.casefold().encode("utf-8")).hexdigest()
+    return output
 
 
 class AgricultureSearch:
-    """Small, in-process cached agricultural web search provider."""
+    """Cached DDGS discovery helper with short negative-cache expiry."""
 
     async def search(self, query: str, max_results: int = 5) -> dict[str, Any]:
-        key = _cache_key(query)
+        key = _cache_key(query, max_results)
         now = time.monotonic()
         cached = _CACHE.get(key)
-        if cached and now - cached[0] < _CACHE_TTL_SECONDS:
+        if cached:
+            ttl = _POSITIVE_CACHE_TTL if cached[1] else _NEGATIVE_CACHE_TTL
+            if now - cached[0] < ttl:
+                return {"query": query, "cached": True, "results": cached[1]}
+            _CACHE.pop(key, None)
+
+        try:
+            results = await asyncio.wait_for(
+                asyncio.to_thread(_search_sync, query, max_results),
+                timeout=_SEARCH_TIMEOUT_SECONDS + 2,
+            )
+        except Exception as exc:
+            # Don't cache transient errors as a long-lived empty result.
+            logger.warning("Agriculture search temporarily unavailable: %s", type(exc).__name__)
             return {
                 "query": query,
-                "cached": True,
-                "results": cached[1],
+                "cached": False,
+                "results": [],
+                "search_error": type(exc).__name__,
             }
 
-        results = await asyncio.to_thread(_search_sync, query, max_results)
         if len(_CACHE) >= _CACHE_MAX_ITEMS:
-            oldest_key = min(_CACHE, key=lambda item: _CACHE[item][0])
-            _CACHE.pop(oldest_key, None)
-        _CACHE[key] = (now, results)
-        return {
-            "query": query,
-            "cached": False,
-            "results": results,
-        }
+            oldest = min(_CACHE, key=lambda item: _CACHE[item][0])
+            _CACHE.pop(oldest, None)
+        _CACHE[key] = (time.monotonic(), results)
+        return {"query": query, "cached": False, "results": results}
 
     async def research(
         self,
@@ -112,76 +139,91 @@ class AgricultureSearch:
     ) -> dict[str, Any]:
         state = str(farmer.get("state") or "").strip()
         district = str(farmer.get("district") or "").strip()
-        location = ", ".join(part for part in (district, state, "India") if part)
+        village = str(farmer.get("village") or "").strip()
+        location = ", ".join(x for x in (district, state, "India") if x)
         month = time.strftime("%B")
         temperature = current_weather.get("temperature_2m")
         humidity = current_weather.get("relative_humidity_2m")
-        rain = current_weather.get("precipitation")
+        rainfall = current_weather.get("precipitation")
 
         if crop and crop.get("name"):
-            crop_name = str(crop["name"])
+            crop_name = str(crop["name"]).strip()
             scientific_name = str(crop.get("scientific_name") or "").strip()
-            crop_identity = " ".join(part for part in (crop_name, scientific_name) if part)
+            identity = " ".join(x for x in (crop_name, scientific_name) if x)
             queries = [
-                f"{crop_identity} cultivation weather management rainfall heat humidity irrigation India",
-                f"{crop_identity} crop protection pest disease management agricultural university India",
-                f"{crop_identity} cultivation package of practices {state} India ICAR university KVK",
+                f'site:icar.gov.in "{crop_name}" package of practices India',
+                f'"{identity}" cultivation package of practices {district} {state} KVK agricultural university',
+                f'"{crop_name}" irrigation crop stage pest disease management India agricultural university',
             ]
             scenario = "existing_crop"
         else:
-            weather_context = (
-                f"current temperature {temperature} C, relative humidity {humidity} percent, "
-                f"current precipitation {rain} mm"
-            )
             queries = [
-                f"crops to sow {month} {location} seasonal crop calendar agriculture university",
-                f"Rabi season suitable crops sowing window {location} India agriculture university KVK",
-                f"crop recommendations based on rainfall temperature soil {location} India ICAR",
+                f'crop calendar sowing season {district} {state} India KVK agricultural university',
+                f'Rabi Zaid crop planning {district} {state} India state agriculture university',
+                f'contingency crop planning rainfall soil {district} {state} India ICAR KVK',
             ]
             scenario = "no_crop"
 
+        # Run searches concurrently, but each request remains independently bounded.
+        reports = await asyncio.gather(
+            *(self.search(query, max_results=5) for query in queries),
+            return_exceptions=True,
+        )
         collected: list[dict[str, Any]] = []
         query_reports: list[dict[str, Any]] = []
-        for query in queries:
-            report = await self.search(query, max_results=5)
+        failures = 0
+        for query, report in zip(queries, reports):
+            if isinstance(report, Exception):
+                failures += 1
+                query_reports.append({"query": query, "cached": False, "result_count": 0})
+                continue
             query_reports.append({
-                "query": report["query"],
-                "cached": report["cached"],
-                "result_count": len(report["results"]),
+                "query": query,
+                "cached": bool(report.get("cached")),
+                "result_count": len(report.get("results") or []),
             })
-            collected.extend(report["results"])
+            if report.get("search_error"):
+                failures += 1
+            collected.extend(report.get("results") or [])
 
-        # Deduplicate by URL while retaining query order.
+        # Deduplicate by canonical URL while retaining the best source label.
         unique: dict[str, dict[str, Any]] = {}
         for result in collected:
-            unique.setdefault(result["url"], result)
-
-        results = list(unique.values())
-        results.sort(
-            key=lambda item: item["source_trust"] != "priority_source_domain"
+            url = result.get("url")
+            if not url:
+                continue
+            previous = unique.get(url)
+            if previous is None or result.get("is_priority_source"):
+                unique[url] = result
+        results = sorted(
+            unique.values(),
+            key=lambda item: (not item.get("is_priority_source", False), item.get("title", "").casefold()),
         )
 
         return {
             "provider": "DuckDuckGo",
-            "status": "results_found" if results else "no_results",
+            "status": "results_found" if results else ("temporarily_unavailable" if failures else "no_results"),
+            "research_status": "discovery_leads_only" if results else ("unavailable" if failures else "no_results"),
             "scenario": scenario,
             "location_context": location or "India",
+            "village_context": village or None,
             "season_context": month,
             "weather_context": {
                 "temperature_c": temperature,
                 "relative_humidity_percent": humidity,
-                "current_precipitation_mm": rain,
+                "current_precipitation_mm": rainfall,
                 "forecast_dates": (daily_forecast.get("time") or [])[:7],
                 "forecast_max_temperature_c": (daily_forecast.get("temperature_2m_max") or [])[:7],
+                "forecast_min_temperature_c": (daily_forecast.get("temperature_2m_min") or [])[:7],
                 "forecast_rainfall_mm": (daily_forecast.get("precipitation_sum") or [])[:7],
             },
             "queries": query_reports,
             "results": results[:12],
             "important_note": (
-                "Search snippets are discovery evidence only. They may be outdated, "
-                "generic or not specific to the farmer's soil, irrigation access, "
-                "variety or crop stage. Verify the linked source and local KVK or "
-                "agriculture-department advisory before presenting a crop as suitable "
-                "or recommending a pesticide, fertilizer dose or treatment."
+                "Search results and snippets are discovery leads, not verified agronomic evidence. "
+                "A priority-domain URL does not prove that its page supports a specific crop, "
+                "district, season, soil or sowing window. Do not present crop suitability, "
+                "pesticide treatments, fertilizer doses or disease diagnoses as verified "
+                "without checking the original authoritative document and its relevant content."
             ),
         }
