@@ -13,11 +13,12 @@ class OllamaClient:
         payload = {
             "model": self.settings.ollama_model,
             "stream": False,
+            "think": False,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
-            "options": {"temperature": 0.2},
+            "options": {"temperature": 0.2, "num_predict": 120},
         }
         try:
             async with httpx.AsyncClient(timeout=self.settings.ollama_timeout_seconds) as client:

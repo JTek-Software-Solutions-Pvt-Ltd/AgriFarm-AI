@@ -184,8 +184,18 @@ class KisanDostGraph:
             return {"model_used": "localized deterministic fallback (Ollama disabled)"}
         language = _language_code(state)
         language_name = LANGUAGE_NAMES[language]
+        history = state.get("conversation_history") or []
+        history_text = "\n".join(
+            f"{'Farmer' if item.get('role') == 'user' else 'Kisan Dost'}: {item.get('content', '')}"
+            for item in history[-20:]
+        )
+        if not history_text:
+            history_text = "No previous conversation."
+
         prompt = (
             f"Required output language: {language_name} (code {language}).\n"
+            f"Previous conversation (oldest first):\n{history_text}\n"
+            f"Use previous conversation to understand follow-up questions.\n"
             f"Farmer's original question: {state['message']}\n"
             f"Intent: {state.get('intent', 'general')}\n"
             f"Verified weather data, if any: {state.get('weather')}\n"

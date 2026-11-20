@@ -18,3 +18,4 @@ safetensors
 asyncpg
 python-multipart
 ddgs>=9.0,<10.0
+numpy

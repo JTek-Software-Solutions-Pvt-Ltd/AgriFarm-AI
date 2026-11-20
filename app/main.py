@@ -44,8 +44,6 @@ async def lifespan(app: FastAPI):
             )
         )
 
-        # Register the single Weather Advisory endpoint.
-        app.include_router(build_weather_router(settings))
 
         yield
 
@@ -64,7 +62,17 @@ async def lifespan(app: FastAPI):
                     "Error while closing agent graph"
                 )
 
-        # Always release the PostgreSQL connection pool.
+        # Close the conversation-history PostgreSQL pool.
+        store = getattr(app.state, "store", None)
+        if store is not None:
+            try:
+                await store.close()
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Error while closing conversation-history pool"
+                )
+
+        # Always release the farmer PostgreSQL connection pool.
         try:
             await close_postgres()
         except Exception:
@@ -77,6 +85,7 @@ app = FastAPI(
     title=settings.app_name,
     version="0.2.2",
     lifespan=lifespan,
+    root_path="/ai",
 )
 
 
@@ -90,12 +99,17 @@ app.add_middleware(
         "http://127.0.0.1:19006",
         "http://localhost:19000",
         "http://127.0.0.1:19000",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# Register Weather Advisory API routes.
+app.include_router(build_weather_router(settings))
 
 # Register Voice API routes.
 app.include_router(voice_router)

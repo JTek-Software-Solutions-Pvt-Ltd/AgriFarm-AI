@@ -26,3 +26,16 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+# Local databases
+*.sqlite3
+*.db
+
+# Backup files
+*.bak
+
+# Audio test files
+*.wav
+tts_samples/
+
+# Python test artifacts
+test_indicf5.py
